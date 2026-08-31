@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dataset files (raw downloads + preprocessed datasets)
+datasets/
+visa.zip
+few_shot_results/
