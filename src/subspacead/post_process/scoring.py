@@ -149,6 +149,56 @@ def calculate_anomaly_scores(X: np.ndarray, pca: dict, method: str, drop_k: int 
         return _calculate_pca_scores(X, pca, method, drop_k)
 
 
+def calculate_cluster_anomaly_scores(
+    X: np.ndarray,
+    pca_params: dict,
+    cluster_pca_params,
+    kmeans_centroids,
+    method: str,
+    drop_k: int = 0,
+) -> np.ndarray:
+    """Compute anomaly scores using per-cluster PCA models (k-means + per-cluster PCA).
+
+    Each token in ``X`` (shape [N, D]) is assigned to the cluster whose centroid
+    is nearest in squared Euclidean distance, then scored with that cluster's
+    PCA model. All tokens are processed in bulk: the loop only iterates over the
+    (small) number of clusters, each step fully vectorized over tokens.
+
+    Falls back to the single global PCA model (``pca_params``) when no cluster
+    models are available (e.g. kernel PCA path), or when a token is assigned to
+    a cluster that has no fitted model (``None`` entry).
+    """
+    X = np.asarray(X, dtype=np.float64)
+
+    if (
+        cluster_pca_params is None
+        or kmeans_centroids is None
+        or len(cluster_pca_params) == 0
+    ):
+        logging.info("use pca_param to calculation final score.")
+        return calculate_anomaly_scores(X, pca_params, method, drop_k)
+
+    centroids = np.asarray(kmeans_centroids, dtype=X.dtype)  # (C, D)
+
+    # Squared Euclidean distance from every token to every centroid: (N, C)
+    dists = (
+        np.sum(X**2, axis=1, keepdims=True)
+        - 2.0 * (X @ centroids.T)
+        + np.sum(centroids**2, axis=1, keepdims=True).T
+    )
+    nearest_cluster = np.argmin(dists, axis=1)
+
+    scores = np.zeros(X.shape[0], dtype=np.float64)
+    for c, pca_c in enumerate(cluster_pca_params):
+        idx = np.where(nearest_cluster == c)[0]
+        if idx.size == 0:
+            continue
+        if pca_c is None:
+            pca_c = pca_params
+        scores[idx] = _calculate_pca_scores(X[idx], pca_c, method, drop_k)
+    return scores
+
+
 def post_process_map(
     anomaly_map: np.ndarray,
     res,

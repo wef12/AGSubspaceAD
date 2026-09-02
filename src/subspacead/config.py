@@ -144,6 +144,12 @@ def get_args():
         "--whiten", action="store_true", help="Apply whitening in PCA."
     )
     pca_group.add_argument(
+        "--kmeans_clusters",
+        type=int,
+        default=8,
+        help="Number of k-means clusters for per-cluster PCA training.",
+    )
+    pca_group.add_argument(
         "--use_kernel_pca",
         action="store_true",
         help="Use Kernel PCA instead of standard PCA.",

@@ -20,7 +20,7 @@ VISA_PATH="/workspace/datasets/VisA_pytorch"
 
 # Categories to run, space-separated (e.g. "candle cashew pcb1").
 # Leave empty to run all categories found in VISA_PATH.
-CATEGORIES="pcb3"
+CATEGORIES="pcb2"
 
 # Number of normal reference samples per category, space-separated (e.g. "1 2 4")
 K_SHOTS="1"
@@ -47,7 +47,11 @@ do
         --pca_ev 0.99 \
         --agg_method "mean" \
         --seed 42 \
-        --outdir "few_shot_results/results_k${k}_visa_dinov2G" 
+        --outdir "few_shot_results/results_k${k}_visa_dinov2G" \
+        --kmeans_clusters 1 
 done
 
 echo "--- All experiments complete ---"
+
+
+# 当kmeans_clusters = 1时，和原流程并无区别

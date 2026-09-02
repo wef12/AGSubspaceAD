@@ -19,6 +19,7 @@ from sklearn.metrics import (
     precision_recall_curve,
     average_precision_score,
 )
+from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 
 from src.subspacead.config import get_args, parse_layer_indices, parse_grouped_layers
@@ -32,6 +33,7 @@ from src.subspacead.core.extractor import FeatureExtractor
 from src.subspacead.core.pca import PCAModel, KernelPCAModel
 from src.subspacead.post_process.scoring import (
     calculate_anomaly_scores,
+    calculate_cluster_anomaly_scores,
     post_process_map,
 )
 from src.subspacead.utils.viz import save_visualization, save_overlay_for_intro
@@ -320,7 +322,7 @@ def main():
                 logging.info(
                     f"--- K-SHOT: Randomly sampling {args.k_shot} training images ---"
                 )
-                random.shuffle(train_paths)
+                #random.shuffle(train_paths)
                 train_paths = (
                     train_paths[: args.k_shot]
                     if args.k_shot <= len(train_paths)
@@ -559,6 +561,10 @@ def main():
             num_batches = math.ceil(total_train_images / args.batch_size)
             feature_generator = feature_generator_full
 
+        # Per-cluster PCA models (k-means + per-cluster PCA), if computed.
+        cluster_pca_params = None
+        kmeans_centroids = None
+
         if args.use_kernel_pca:
             if args.bg_mask_method == "pca_normality":
                 logging.error(
@@ -584,6 +590,78 @@ def main():
             )
             pca_params = pca_model.fit(all_train_tokens)
         else:
+            # --- K-means clustering of training tokens + per-cluster PCA ---
+            logging.info(
+                f"Collecting training tokens for k-means clustering "
+                f"(n_clusters={args.kmeans_clusters})..."
+            )
+            all_train_tokens = np.concatenate(
+                list(
+                    tqdm(
+                        feature_generator(),
+                        desc="Token Collection for K-means",
+                        total=num_batches,
+                    )
+                )
+            )
+            logging.info(
+                f"Collected {all_train_tokens.shape[0]} tokens with dim={all_train_tokens.shape[1]}."
+            )
+
+            kmeans_centroids = None
+            cluster_pca_params = None
+            if all_train_tokens.shape[0] == 0:
+                logging.error(
+                    "No training tokens collected; skipping k-means and per-cluster PCA."
+                )
+            else:
+                kmeans = KMeans(
+                    n_clusters=args.kmeans_clusters,
+                    random_state=args.seed,
+                    n_init=10,
+                ).fit(all_train_tokens)
+                cluster_labels = kmeans.labels_
+                kmeans_centroids = kmeans.cluster_centers_
+
+                # Fit one PCA model per cluster
+                cluster_pca_params = []
+                for c in range(args.kmeans_clusters):
+                    cluster_tokens = all_train_tokens[cluster_labels == c]
+                    if cluster_tokens.shape[0] < 2:
+                        logging.warning(
+                            f"Cluster {c} has only {cluster_tokens.shape[0]} token(s); "
+                            "skipping per-cluster PCA."
+                        )
+                        cluster_pca_params.append(None)
+                        continue
+                    logging.info(
+                        f"Fitting PCA for cluster {c}: {cluster_tokens.shape[0]} tokens."
+                    )
+                    cluster_num_batches = math.ceil(
+                        cluster_tokens.shape[0] / args.batch_size
+                    )
+
+                    def cluster_feature_generator(tokens=cluster_tokens):
+                        for i in range(0, tokens.shape[0], args.batch_size):
+                            yield tokens[i : i + args.batch_size]
+
+                    pca_model_c = PCAModel(
+                        k=args.pca_dim, ev=args.pca_ev, whiten=args.whiten
+                    )
+                    cluster_pca_params.append(
+                        pca_model_c.fit(
+                            cluster_feature_generator,
+                            feature_dim,
+                            cluster_tokens.shape[0],
+                            cluster_num_batches,
+                        )
+                    )
+                logging.info(
+                    f"K-means clustering done: {args.kmeans_clusters} clusters; "
+                    f"trained {len(cluster_pca_params)} per-cluster PCA models. "
+                    "Cluster centroids saved in kmeans_centroids."
+                )
+
             pca_model = PCAModel(k=args.pca_dim, ev=args.pca_ev, whiten=args.whiten)
             pca_params = pca_model.fit(
                 feature_generator,
@@ -900,9 +978,11 @@ def main():
                         dino_saliency_layer=args.dino_saliency_layer,
                     )
                     # A minimal version of the scoring
-                    _scores = calculate_anomaly_scores(
+                    _scores = calculate_cluster_anomaly_scores(
                         _tokens.reshape(-1, _tokens.shape[-1]),
                         pca_params,
+                        cluster_pca_params,
+                        kmeans_centroids,
                         args.score_method,
                         args.drop_k,
                     )
@@ -1000,9 +1080,11 @@ def main():
                 tokens_reshaped = tokens.reshape(b * h_p * w_p, c)
 
                 # Step 2: Anomaly Scoring
-                scores = calculate_anomaly_scores(
+                scores = calculate_cluster_anomaly_scores(
                     tokens_reshaped,
                     pca_params,
+                    cluster_pca_params,
+                    kmeans_centroids,
                     args.score_method,
                     args.drop_k,
                 )
