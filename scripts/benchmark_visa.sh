@@ -20,7 +20,7 @@ VISA_PATH="/workspace/datasets/VisA_pytorch"
 
 # Categories to run, space-separated (e.g. "candle cashew pcb1").
 # Leave empty to run all categories found in VISA_PATH.
-CATEGORIES="pcb2"
+CATEGORIES="macaroni2"
 
 # Number of normal reference samples per category, space-separated (e.g. "1 2 4")
 K_SHOTS="1"
@@ -43,15 +43,22 @@ do
         --k_shot $k \
         --layers="-12,-13,-14,-15,-16,-17,-18" \
         --model_ckpt "facebook/dinov2-with-registers-giant" \
-        --aug_count 30 \
+        --aug_count 15 \
         --pca_ev 0.99 \
         --agg_method "mean" \
         --seed 42 \
         --outdir "few_shot_results/results_k${k}_visa_dinov2G" \
-        --kmeans_clusters 1 
+        --kmeans_clusters 10 \
+        --cluster_method wkmeans \
+        --dino_saliency_layer 9
+        #--use_topk_cluster_pca \
+        #--topk_cluster_pca_t 3 \
 done
 
 echo "--- All experiments complete ---"
 
 
 # 当kmeans_clusters = 1时，和原流程并无区别
+# 添加--use_topk_cluster_pca时，开启soft top-k计算异常得分，并可使用--topk_cluster_pca_t确定数量
+# --dino_saliency_layer设定显著图提取层数
+# --cluster_method设定分簇算法，目前可选kmeans，wkmeans

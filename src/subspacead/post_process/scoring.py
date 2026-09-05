@@ -199,6 +199,89 @@ def calculate_cluster_anomaly_scores(
     return scores
 
 
+def calculate_cluster_topk_anomaly_scores(
+    X: np.ndarray,
+    pca_params: dict,
+    cluster_pca_params,
+    kmeans_centroids,
+    method: str,
+    drop_k: int = 0,
+    top_k: int = 3,
+) -> np.ndarray:
+    """Compute anomaly scores using the ``top_k`` nearest per-cluster PCA models.
+
+    Soft-cluster alternative to ``calculate_cluster_anomaly_scores`` (which uses
+    hard assignment to the single nearest centroid). For each token:
+
+    1. Compute the squared Euclidean distance to every k-means centroid.
+    2. Select the ``top_k`` nearest centroids (e.g. T=3).
+    3. Reconstruct the token with each of those clusters' PCA models and obtain
+       its per-token residual.
+    4. Combine the residuals with an inverse-distance weighted average, where the
+       distance is the (Euclidean) distance to the centroid:
+
+       score_i = (Σ_{c∈topk(i)} r_ic / d_ic) / (Σ_{c∈topk(i)} 1 / d_ic)
+
+    All tokens are processed in bulk: the loop only iterates over the (small)
+    number of clusters, each step fully vectorized over tokens.
+
+    Falls back to the single global PCA model (``pca_params``) when no cluster
+    models are available (e.g. kernel PCA path), or to the single-nearest-cluster
+    behavior when ``top_k < 2``. Clusters without a fitted model (``None`` entry)
+    fall back to the global model, mirroring ``calculate_cluster_anomaly_scores``.
+    """
+    X = np.asarray(X, dtype=np.float64)
+
+    if (
+        cluster_pca_params is None
+        or kmeans_centroids is None
+        or len(cluster_pca_params) == 0
+    ):
+        logging.info("use pca_param to calculation final score.")
+        return calculate_anomaly_scores(X, pca_params, method, drop_k)
+
+    if top_k < 2:
+        logging.info("top_k < 2; using the single nearest cluster model.")
+        return calculate_cluster_anomaly_scores(
+            X, pca_params, cluster_pca_params, kmeans_centroids, method, drop_k
+        )
+
+    centroids = np.asarray(kmeans_centroids, dtype=X.dtype)  # (C, D)
+    num_clusters = centroids.shape[0]
+    k = min(int(top_k), num_clusters)
+
+    # Squared Euclidean distance from every token to every centroid: (N, C)
+    dists = (
+        np.sum(X**2, axis=1, keepdims=True)
+        - 2.0 * (X @ centroids.T)
+        + np.sum(centroids**2, axis=1, keepdims=True).T
+    )
+
+    # Indices of the k nearest centroids per token (row-major, unsorted inside).
+    nn_idx = np.argpartition(dists, kth=k - 1, axis=1)[:, :k]
+
+    # Inverse-distance weights (distance = Euclidean), normalized per token so
+    # that the final score is a weighted average over its top-k neighbors.
+    eps = 1e-12
+    inv_d = 1.0 / np.maximum(np.sqrt(np.maximum(dists, 0.0)), eps)  # (N, C)
+    w = np.take_along_axis(inv_d, nn_idx, axis=1)  # (N, k)
+    w = w / np.maximum(w.sum(axis=1, keepdims=True), eps)  # (N, k)
+
+    scores = np.zeros(X.shape[0], dtype=np.float64)
+    for c in range(min(len(cluster_pca_params), num_clusters)):
+        pca_c = cluster_pca_params[c]
+        mask = nn_idx == c  # (N, k) bool: rows whose neighbor set contains c
+        rows = np.any(mask, axis=1)
+        if not rows.any():
+            continue
+        if pca_c is None:
+            pca_c = pca_params
+        r = _calculate_pca_scores(X[rows], pca_c, method, drop_k)
+        w_c = w[rows][mask[rows]]  # one weight per selected token
+        scores[rows] += w_c * r
+    return scores
+
+
 def post_process_map(
     anomaly_map: np.ndarray,
     res,

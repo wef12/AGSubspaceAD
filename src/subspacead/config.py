@@ -147,7 +147,39 @@ def get_args():
         "--kmeans_clusters",
         type=int,
         default=8,
-        help="Number of k-means clusters for per-cluster PCA training.",
+        help="Number of clusters for per-cluster PCA training.",
+    )
+    pca_group.add_argument(
+        "--cluster_method",
+        type=str,
+        default="kmeans",
+        choices=[
+            "kmeans",
+            "wkmeans",
+            "recursive_split",
+            "hierarchical_split",
+            "adaptive_select",
+        ],
+        help="Clustering algorithm used to partition training tokens before "
+        "per-cluster PCA training. Keep in sync with CLUSTER_FUNCTIONS in "
+        "src/subspacead/core/clustering.py. 'wkmeans' uses the per-token "
+        "DINOv2 saliency masks as weights. 'recursive_split', "
+        "'hierarchical_split' and 'adaptive_select' are reserved and not yet "
+        "implemented. Default: kmeans.",
+    )
+    pca_group.add_argument(
+        "--use_topk_cluster_pca",
+        action="store_true",
+        help="For each token, score with the T nearest per-cluster PCA models and "
+        "combine their reconstruction residuals via inverse-distance weighting, "
+        "instead of using only the single nearest cluster model.",
+    )
+    pca_group.add_argument(
+        "--topk_cluster_pca_t",
+        type=int,
+        default=3,
+        help="Number T of nearest per-cluster PCA models to combine when "
+        "--use_topk_cluster_pca is enabled.",
     )
     pca_group.add_argument(
         "--use_kernel_pca",

@@ -2,6 +2,7 @@ import os
 import math
 import logging
 import time
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,6 @@ from sklearn.metrics import (
     precision_recall_curve,
     average_precision_score,
 )
-from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 
 from src.subspacead.config import get_args, parse_layer_indices, parse_grouped_layers
@@ -29,11 +29,13 @@ from src.subspacead.utils.common import (
     min_max_norm,
 )
 from src.subspacead.data.datasets import get_dataset_handler
+from src.subspacead.core.clustering import fit_cluster_pca
 from src.subspacead.core.extractor import FeatureExtractor
 from src.subspacead.core.pca import PCAModel, KernelPCAModel
 from src.subspacead.post_process.scoring import (
     calculate_anomaly_scores,
     calculate_cluster_anomaly_scores,
+    calculate_cluster_topk_anomaly_scores,
     post_process_map,
 )
 from src.subspacead.utils.viz import save_visualization, save_overlay_for_intro
@@ -416,17 +418,15 @@ def main():
                                 dino_saliency_layer=args.dino_saliency_layer,
                             )
                             tokens_flat = tokens_batch.reshape(-1, feature_dim)
+                            masks_flat = saliency_masks_batch.reshape(-1)
 
                             if args.bg_mask_method == "dino_saliency":
-                                masks_flat = saliency_masks_batch.reshape(-1)
                                 try:
                                     if args.mask_threshold_method == "percentile":
                                         threshold = np.percentile(
                                             masks_flat, args.percentile_threshold * 100
                                         )
-                                        foreground_tokens = tokens_flat[
-                                            masks_flat >= threshold
-                                        ]
+                                        foreground_idx = masks_flat >= threshold
                                     else:
                                         norm_mask = cv2.normalize(
                                             masks_flat,
@@ -442,24 +442,28 @@ def main():
                                             255,
                                             cv2.THRESH_BINARY + cv2.THRESH_OTSU,
                                         )
-                                        foreground_tokens = tokens_flat[
-                                            binary_mask.flatten() > 0
-                                        ]
+                                        foreground_idx = binary_mask.flatten() > 0
+
+                                    foreground_tokens = tokens_flat[foreground_idx]
+                                    foreground_masks = masks_flat[foreground_idx]
 
                                     if foreground_tokens.shape[0] > 0:
-                                        yield foreground_tokens
+                                        # Yield tokens together with their aligned
+                                        # per-token saliency values so that
+                                        # clustering algorithms can use them.
+                                        yield foreground_tokens, foreground_masks
                                     else:
                                         logging.warning(
                                             "No foreground patch tokens found. Yielding all tokens."
                                         )
-                                        yield tokens_flat
+                                        yield tokens_flat, masks_flat
                                 except Exception as e:
                                     logging.warning(
                                         f"Masking failed: {e}. Yielding all tokens."
                                     )
-                                    yield tokens_flat
+                                    yield tokens_flat, masks_flat
                             else:
-                                yield tokens_flat
+                                yield tokens_flat, masks_flat
 
             feature_generator = feature_generator_patched
 
@@ -514,16 +518,16 @@ def main():
                         dino_saliency_layer=args.dino_saliency_layer,
                     )
                     tokens_flat = tokens_batch.reshape(-1, feature_dim)
+                    masks_flat = saliency_masks_batch.reshape(-1)
 
                     # Train masking logic
                     if args.bg_mask_method == "dino_saliency":
-                        masks_flat = saliency_masks_batch.reshape(-1)
                         try:
                             if args.mask_threshold_method == "percentile":
                                 threshold = np.percentile(
                                     masks_flat, args.percentile_threshold * 100
                                 )
-                                foreground_tokens = tokens_flat[masks_flat >= threshold]
+                                foreground_idx = masks_flat >= threshold
                             else:
                                 norm_mask = cv2.normalize(
                                     masks_flat,
@@ -539,29 +543,33 @@ def main():
                                     255,
                                     cv2.THRESH_BINARY + cv2.THRESH_OTSU,
                                 )
-                                foreground_tokens = tokens_flat[
-                                    binary_mask.flatten() > 0
-                                ]
+                                foreground_idx = binary_mask.flatten() > 0
+
+                            foreground_tokens = tokens_flat[foreground_idx]
+                            foreground_masks = masks_flat[foreground_idx]
 
                             if foreground_tokens.shape[0] > 0:
-                                yield foreground_tokens
+                                # Yield tokens together with their aligned
+                                # per-token saliency values so that clustering
+                                # algorithms can use them.
+                                yield foreground_tokens, foreground_masks
                             else:
                                 logging.warning(
                                     "No foreground tokens found. Yielding all tokens."
                                 )
-                                yield tokens_flat
+                                yield tokens_flat, masks_flat
                         except Exception as e:
                             logging.warning(
                                 f"Masking failed: {e}. Yielding all tokens."
                             )
-                            yield tokens_flat
+                            yield tokens_flat, masks_flat
                     else:
-                        yield tokens_flat
+                        yield tokens_flat, masks_flat
 
             num_batches = math.ceil(total_train_images / args.batch_size)
             feature_generator = feature_generator_full
 
-        # Per-cluster PCA models (k-means + per-cluster PCA), if computed.
+        # Per-cluster PCA models (clustering + per-cluster PCA), if computed.
         cluster_pca_params = None
         kmeans_centroids = None
 
@@ -575,13 +583,14 @@ def main():
 
             logging.info("Collecting all features for Kernel PCA...")
             all_train_tokens = np.concatenate(
-                list(
-                    tqdm(
+                [
+                    batch_tokens
+                    for batch_tokens, _ in tqdm(
                         feature_generator(),
                         desc="Feature Collection",
                         total=num_batches,
                     )
-                )
+                ]
             )
             pca_model = KernelPCAModel(
                 k=args.pca_dim,
@@ -590,85 +599,53 @@ def main():
             )
             pca_params = pca_model.fit(all_train_tokens)
         else:
-            # --- K-means clustering of training tokens + per-cluster PCA ---
+            # Cluster the training tokens, then fit one PCA model per cluster.
+            # The clustering algorithm is selected via --cluster_method; see
+            # src/subspacead/core/clustering.py. The result is kept in the
+            # variable ``kmeans_centroids`` for backwards compatibility with the
+            # scoring functions below.
+            kmeans_centroids, cluster_pca_params = fit_cluster_pca(
+                feature_generator=feature_generator,
+                num_batches=num_batches,
+                cluster_method=args.cluster_method,
+                n_clusters=args.kmeans_clusters,
+                batch_size=args.batch_size,
+                pca_dim=args.pca_dim,
+                pca_ev=args.pca_ev,
+                whiten=args.whiten,
+                random_state=args.seed,
+            )
+
+            # The training generators yield (tokens, saliency_masks) so that
+            # saliency information can reach clustering algorithms; the global
+            # PCA fit only needs the raw tokens, hence the wrapper.
+            def tokens_only_feature_generator():
+                for batch_tokens, _ in feature_generator():
+                    yield batch_tokens
+
+            #pca_model = PCAModel(k=args.pca_dim, ev=args.pca_ev, whiten=args.whiten)
+            #pca_params = pca_model.fit(
+            #    tokens_only_feature_generator,
+            #    feature_dim,
+            #    total_tokens,
+            #    num_batches,
+            #)
+            pca_params = cluster_pca_params
+
+        # Cluster scorer: hard assignment to the nearest cluster or, when
+        # --use_topk_cluster_pca is set, an inverse-distance weighted average
+        # of the T nearest per-cluster PCA models.
+        if args.use_topk_cluster_pca:
+            cluster_scorer = partial(
+                calculate_cluster_topk_anomaly_scores,
+                top_k=args.topk_cluster_pca_t,
+            )
             logging.info(
-                f"Collecting training tokens for k-means clustering "
-                f"(n_clusters={args.kmeans_clusters})..."
+                f"Using top-{args.topk_cluster_pca_t} cluster PCA scoring "
+                "(inverse-distance weighted)."
             )
-            all_train_tokens = np.concatenate(
-                list(
-                    tqdm(
-                        feature_generator(),
-                        desc="Token Collection for K-means",
-                        total=num_batches,
-                    )
-                )
-            )
-            logging.info(
-                f"Collected {all_train_tokens.shape[0]} tokens with dim={all_train_tokens.shape[1]}."
-            )
-
-            kmeans_centroids = None
-            cluster_pca_params = None
-            if all_train_tokens.shape[0] == 0:
-                logging.error(
-                    "No training tokens collected; skipping k-means and per-cluster PCA."
-                )
-            else:
-                kmeans = KMeans(
-                    n_clusters=args.kmeans_clusters,
-                    random_state=args.seed,
-                    n_init=10,
-                ).fit(all_train_tokens)
-                cluster_labels = kmeans.labels_
-                kmeans_centroids = kmeans.cluster_centers_
-
-                # Fit one PCA model per cluster
-                cluster_pca_params = []
-                for c in range(args.kmeans_clusters):
-                    cluster_tokens = all_train_tokens[cluster_labels == c]
-                    if cluster_tokens.shape[0] < 2:
-                        logging.warning(
-                            f"Cluster {c} has only {cluster_tokens.shape[0]} token(s); "
-                            "skipping per-cluster PCA."
-                        )
-                        cluster_pca_params.append(None)
-                        continue
-                    logging.info(
-                        f"Fitting PCA for cluster {c}: {cluster_tokens.shape[0]} tokens."
-                    )
-                    cluster_num_batches = math.ceil(
-                        cluster_tokens.shape[0] / args.batch_size
-                    )
-
-                    def cluster_feature_generator(tokens=cluster_tokens):
-                        for i in range(0, tokens.shape[0], args.batch_size):
-                            yield tokens[i : i + args.batch_size]
-
-                    pca_model_c = PCAModel(
-                        k=args.pca_dim, ev=args.pca_ev, whiten=args.whiten
-                    )
-                    cluster_pca_params.append(
-                        pca_model_c.fit(
-                            cluster_feature_generator,
-                            feature_dim,
-                            cluster_tokens.shape[0],
-                            cluster_num_batches,
-                        )
-                    )
-                logging.info(
-                    f"K-means clustering done: {args.kmeans_clusters} clusters; "
-                    f"trained {len(cluster_pca_params)} per-cluster PCA models. "
-                    "Cluster centroids saved in kmeans_centroids."
-                )
-
-            pca_model = PCAModel(k=args.pca_dim, ev=args.pca_ev, whiten=args.whiten)
-            pca_params = pca_model.fit(
-                feature_generator,
-                feature_dim,
-                total_tokens,
-                num_batches,
-            )
+        else:
+            cluster_scorer = calculate_cluster_anomaly_scores
 
         # 2. Determine PR-optimal F1 thresholds (if validation set exists)
         if val_paths:
@@ -978,7 +955,7 @@ def main():
                         dino_saliency_layer=args.dino_saliency_layer,
                     )
                     # A minimal version of the scoring
-                    _scores = calculate_cluster_anomaly_scores(
+                    _scores = cluster_scorer(
                         _tokens.reshape(-1, _tokens.shape[-1]),
                         pca_params,
                         cluster_pca_params,
@@ -1080,7 +1057,7 @@ def main():
                 tokens_reshaped = tokens.reshape(b * h_p * w_p, c)
 
                 # Step 2: Anomaly Scoring
-                scores = calculate_cluster_anomaly_scores(
+                scores = cluster_scorer(
                     tokens_reshaped,
                     pca_params,
                     cluster_pca_params,
